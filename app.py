@@ -15,7 +15,6 @@ from bs4 import BeautifulSoup
 from PIL import Image, ImageFile
 
 # ✅ OpenCV (사각 상품컷 오브젝트 감지용)
-import cv2
 
 # 큰 JPG 일부 로딩 이슈 완화
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -202,7 +201,8 @@ def trim_white_margin_tight(img: Image.Image, thr: int = WHITE_THR) -> Image.Ima
 # -----------------------------
 def detect_rect_photo_boxes(img: Image.Image) -> List[Tuple[int, int, int, int]]:
     """
-    흰 배경 기반 상세페이지에서 '사진(사각 오브젝트)'로 보이는 영역을 검출.
+    OpenCV 없이 numpy만으로 흰 배경 위의 큰 사진 오브젝트를 대략 검출.
+    Streamlit Cloud 배포 속도를 위해 opencv-python-headless 의존성을 제거한 경량 버전.
     반환: (x0,y0,x1,y1) 리스트
     """
     if img.mode != "RGB":
@@ -211,33 +211,52 @@ def detect_rect_photo_boxes(img: Image.Image) -> List[Tuple[int, int, int, int]]
     arr = np.array(img)
     h, w = arr.shape[:2]
 
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    _, bin_inv = cv2.threshold(gray, WHITE_THR, 255, cv2.THRESH_BINARY_INV)
+    # 흰 배경이 아닌 영역을 후보로 잡고, 작은 노이즈는 행/열 투영 방식으로 묶는다.
+    non_white = ~((arr[:, :, 0] >= WHITE_THR) & (arr[:, :, 1] >= WHITE_THR) & (arr[:, :, 2] >= WHITE_THR))
 
-    kernel = np.ones((5, 5), np.uint8)
-    bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_CLOSE, kernel, iterations=2)
-    bin_inv = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, kernel, iterations=1)
+    row_ratio = non_white.mean(axis=1)
+    col_ratio = non_white.mean(axis=0)
 
-    contours, _ = cv2.findContours(bin_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def ranges_from_mask(mask: np.ndarray, min_len: int) -> List[Tuple[int, int]]:
+        ranges: List[Tuple[int, int]] = []
+        start = None
+        for i, v in enumerate(mask):
+            if bool(v) and start is None:
+                start = i
+            elif (not bool(v)) and start is not None:
+                end = i - 1
+                if end - start + 1 >= min_len:
+                    ranges.append((start, end))
+                start = None
+        if start is not None:
+            end = len(mask) - 1
+            if end - start + 1 >= min_len:
+                ranges.append((start, end))
+        return ranges
 
+    # 사진 영역은 보통 행 기준으로 꽤 넓게 비흰색 픽셀이 존재한다.
+    row_ranges = ranges_from_mask(row_ratio > 0.02, min_len=180)
     boxes: List[Tuple[int, int, int, int]] = []
-    min_area = max(200 * 200, int((w * h) * 0.01))
-    max_area = int((w * h) * 0.98)
 
-    for cnt in contours:
-        x, y, ww, hh = cv2.boundingRect(cnt)
-        area = ww * hh
-        if area < min_area or area > max_area:
+    for y0, y1 in row_ranges:
+        band = non_white[y0:y1 + 1, :]
+        if band.size == 0:
             continue
-        if ww < 220 or hh < 220:
+        band_col_ratio = band.mean(axis=0)
+        col_ranges = ranges_from_mask(band_col_ratio > 0.01, min_len=220)
+        if not col_ranges:
             continue
-
-        pad = 2
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(w, x + ww + pad)
-        y1 = min(h, y + hh + pad)
-        boxes.append((x0, y0, x1, y1))
+        # 한 행 구간 안에 여러 사진이 있을 수 있어 각각 박스로 반환
+        for x0, x1 in col_ranges:
+            ww = x1 - x0 + 1
+            hh = y1 - y0 + 1
+            area = ww * hh
+            if ww < 220 or hh < 220:
+                continue
+            if area < max(200 * 200, int((w * h) * 0.005)) or area > int((w * h) * 0.98):
+                continue
+            pad = 2
+            boxes.append((max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + 1 + pad), min(h, y1 + 1 + pad)))
 
     boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
 
@@ -254,7 +273,6 @@ def detect_rect_photo_boxes(img: Image.Image) -> List[Tuple[int, int, int, int]]
             filtered.append(b)
 
     return filtered
-
 
 
 def split_into_photo_objects(img: Image.Image) -> List[Image.Image]:
